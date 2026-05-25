@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: LMCache \n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-05-18 17:25+0000\n"
+"POT-Creation-Date: 2026-05-25 10:41+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: zh_CN\n"
@@ -30,14 +30,18 @@ msgid ""
 "server over ZMQ and exercises the full KV-cache data path for a sequence "
 "of synthetic requests, then optionally verifies per-chunk checksums "
 "through the HTTP API."
-msgstr "``lmcache bench kvcache`` 命令是对 LMCache 多进程 (MP) 缓存服务器的端到端完整性测试。它通过 ZMQ 连接到正在运行的服务器，并对一系列合成请求执行完整的 KV 缓存数据路径，然后可选地通过 HTTP API 验证每个块的校验和。"
+msgstr ""
+"``lmcache bench kvcache`` 命令是对 LMCache 多进程 (MP) 缓存服务器的端到端完整性测试。它通过 ZMQ "
+"连接到正在运行的服务器，并对一系列合成请求执行完整的 KV 缓存数据路径，然后可选地通过 HTTP API 验证每个块的校验和。"
 
 #: ../../source/cli/bench_kvcache.rst:14
 msgid ""
 "Unlike :ref:`lmcache bench engine <lmcache-bench-engine>`, this command "
 "does **not** require an inference engine. It only needs a running LMCache"
 " MP server (ZMQ + HTTP) and a GPU."
-msgstr "与 :ref:`lmcache bench engine <lmcache-bench-engine>` 不同，此命令**不**需要推理引擎。它只需要一个正在运行的 LMCache MP 服务器（ZMQ + HTTP）和一个 GPU。"
+msgstr ""
+"与 :ref:`lmcache bench engine <lmcache-bench-engine>` "
+"不同，此命令**不**需要推理引擎。它只需要一个正在运行的 LMCache MP 服务器（ZMQ + HTTP）和一个 GPU。"
 
 #: ../../source/cli/bench_kvcache.rst:20
 msgid "What it does"
@@ -70,7 +74,9 @@ msgid ""
 "are additionally cross-checked against the server-side computation, so a "
 "mismatch between producer and consumer surfaces as a loud ``CHECKSUM "
 "MISMATCH`` log line."
-msgstr "当 ``--url`` 指向服务器的 HTTP 端点时，逐块的校验和会额外与服务器端的计算进行交叉检查，因此生产者和消费者之间的不匹配会以显眼的 ``CHECKSUM MISMATCH`` 日志行的形式显现出来。"
+msgstr ""
+"当 ``--url`` 指向服务器的 HTTP 端点时，逐块的校验和会额外与服务器端的计算进行交叉检查，因此生产者和消费者之间的不匹配会以显眼的 "
+"``CHECKSUM MISMATCH`` 日志行的形式显现出来。"
 
 #: ../../source/cli/bench_kvcache.rst:43
 msgid "Quick start"
@@ -88,7 +94,9 @@ msgstr "然后在另一个终端中："
 msgid ""
 "By default the tool runs forever (``--end`` unset); stop it with "
 "``Ctrl-C`` at any time. Pass ``--end N`` for a bounded run."
-msgstr "默认情况下，该工具会一直运行（``--end`` 未设置）；您可以随时使用 ``Ctrl-C`` 停止它。传递 ``--end N`` 以进行有限次运行。"
+msgstr ""
+"默认情况下，该工具会一直运行（``--end`` 未设置）；您可以随时使用 ``Ctrl-C`` 停止它。传递 ``--end N`` "
+"以进行有限次运行。"
 
 #: ../../source/cli/bench_kvcache.rst:67
 msgid "Options"
@@ -272,7 +280,10 @@ msgid ""
 "``dtype`` -- element dtype (e.g. ``float16``, ``bfloat16``, ``float32``, "
 "``uint8``). The full set matches the keys of ``DTYPE_MAP`` in "
 "``lmcache/v1/kv_layer_groups.py``."
-msgstr "``dtype`` -- 元素数据类型（例如 ``float16``、``bfloat16``、``float32``、``uint8``）。完整的集合与 ``lmcache/v1/kv_layer_groups.py`` 中的 ``DTYPE_MAP`` 的键匹配。"
+msgstr ""
+"``dtype`` -- 元素数据类型（例如 "
+"``float16``、``bfloat16``、``float32``、``uint8``）。完整的集合与 "
+"``lmcache/v1/kv_layer_groups.py`` 中的 ``DTYPE_MAP`` 的键匹配。"
 
 #: ../../source/cli/bench_kvcache.rst:131
 msgid "``layers`` -- number of layers in this group."
@@ -295,7 +306,9 @@ msgstr "所有组必须共享相同的 ``NB`` 和 ``BS``（这是分页 KV 的�
 msgid ""
 "See ``parse_kvcache_shape_spec`` in ``lmcache/v1/kv_layer_groups.py`` for"
 " the authoritative parsing rules and validation errors."
-msgstr "请参阅 ``parse_kvcache_shape_spec`` 在 ``lmcache/v1/kv_layer_groups.py`` 中的权威解析规则和验证错误。"
+msgstr ""
+"请参阅 ``parse_kvcache_shape_spec`` 在 ``lmcache/v1/kv_layer_groups.py`` "
+"中的权威解析规则和验证错误。"
 
 #: ../../source/cli/bench_kvcache.rst:151
 msgid "Example output"
@@ -346,6 +359,12 @@ msgid ""
 msgstr "：doc:`bench` -- ``lmcache bench engine`` 用于引擎端工作负载基准测试。"
 
 #: ../../source/cli/bench_kvcache.rst:191
+msgid ""
+":doc:`bench_l2` -- ``lmcache bench l2`` for store / lookup / load "
+"throughput benchmarks against an L2 cache adapter."
+msgstr "：doc:`bench_l2` -- ``lmcache bench l2`` 用于针对 L2 缓存适配器的存储/查找/加载吞吐量基准测试。"
+
+#: ../../source/cli/bench_kvcache.rst:194
 msgid ""
 ":doc:`kvcache` -- ``lmcache kvcache`` for managing KV cache state on a "
 "running server (clear, etc.)."
