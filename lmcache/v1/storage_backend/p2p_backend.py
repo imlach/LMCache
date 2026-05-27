@@ -34,6 +34,11 @@ from lmcache.v1.rpc_utils import (
     get_zmq_socket_with_timeout,
 )
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.v1.storage_backend.hybrid_state_wire import (
+    decode_and_store_hybrid_state,
+    encode_hybrid_state,
+    pop_pending_hybrid_state_key,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.transfer_channel import CreateTransferChannel
 from lmcache.v1.transfer_channel.transfer_utils import (
@@ -67,12 +72,40 @@ class BatchedLookupAndGetMsg(P2PMsgBase):
     # Indexes (remote) of allocated memory objects (to be written)
     mem_indexes: list[int]
 
+    # ── Hybrid-state extension (msg_version >= 1) ───────────────────────────
+    # Optional key identifying the receiver's hybrid-state checkpoint that
+    # this lookup expects. When set AND the sender has a matching entry in
+    # its hybrid-state LRU AND num_hit_chunks > 0, the sender attaches the
+    # serialized payload to the reply (BatchedLookupAndGetRetMsg.hybrid_state_bytes).
+    #
+    # ``None`` here means either (a) pure-attention model, (b) the
+    # integration layer didn't compute a key (no hybrid groups), or (c) the
+    # receiver is running pre-extension code. All three cases keep the
+    # existing attention-only behaviour.
+    hybrid_state_key: Optional[tuple[int, str]] = None
+
+    # Wire-protocol version requested by the receiver. ``0`` is pre-extension
+    # (no hybrid state). ``1`` is the hybrid-state wire extension. Receivers
+    # that don't speak v1 simply omit ``hybrid_state_key`` and leave this at
+    # the default; old senders ignore unknown fields and reply with the
+    # legacy ``BatchedLookupAndGetRetMsg`` (no ``hybrid_state_bytes``), which
+    # the receiver also tolerates.
+    msg_version: int = 0
+
 
 class BatchedLookupAndGetRetMsg(P2PMsgBase):
     """Lookup and retrieve message"""
 
     # Number of hit chunks
     num_hit_chunks: int
+
+    # ── Hybrid-state extension (only set when sender produced a payload) ───
+    # Serialized ``HybridStateWirePayload`` (msgpack bytes). When present
+    # AND ``num_hit_chunks > 0``, the receiver deserializes and stores the
+    # payload in its local hybrid-state LRU before returning from the
+    # lookup, so the scheduler's external-hit gate finds matching local
+    # hybrid state and reports the correct cached-token count.
+    hybrid_state_bytes: Optional[bytes] = None
 
 
 class BatchedLookupAndPutMsg(P2PMsgBase):
@@ -426,7 +459,27 @@ class P2PBackend(StorageBackendInterface):
                 transfer_spec=channel_transfer_spec,
             )
 
-            return BatchedLookupAndGetRetMsg(num_hit_chunks=num_hit_chunks)
+            # ── Hybrid-state wire extension (PR #3284 follow-on) ────────────
+            # If the receiver advertised a hybrid_state_key AND we got
+            # at least one attention KV hit, look up our process-local
+            # hybrid-state LRU via the registered codec and attach the
+            # serialized payload. The codec returns None on any miss
+            # (no registered codec, no LRU entry, encoder error) — in
+            # all cases we fall through to the legacy reply shape, and
+            # the receiver treats it as "no hybrid state available" and
+            # falls back to recompute on its GDN/Mamba layers.
+            hybrid_state_bytes: Optional[bytes] = None
+            if (
+                num_hit_chunks > 0
+                and msg.hybrid_state_key is not None
+                and msg.msg_version >= 1
+            ):
+                hybrid_state_bytes = encode_hybrid_state(msg.hybrid_state_key)
+
+            return BatchedLookupAndGetRetMsg(
+                num_hit_chunks=num_hit_chunks,
+                hybrid_state_bytes=hybrid_state_bytes,
+            )
         except Exception as e:
             logger.error(
                 "Error during P2P batched lookup and get operation "
@@ -576,12 +629,26 @@ class P2PBackend(StorageBackendInterface):
 
         local_indexes = self.transfer_channel.get_local_mem_indices(mem_objs)
 
+        # ── Hybrid-state extension: pick up the key the scheduler computed ──
+        # The integration layer (vllm_v1_adapter.get_num_new_matched_tokens)
+        # stashes a (num_tokens, blake2b16_hex) key in the hybrid_state_wire
+        # broker, keyed by lookup_id, just before calling lookup_client.lookup.
+        # We pop it here at the moment the P2P GET fires. ``None`` means
+        # either (a) pure-attention model, (b) integration layer pre-extension,
+        # or (c) no aligned-prefix candidate — in any of those cases we
+        # default msg_version=0 and the sender skips the hybrid-state encode
+        # path entirely.
+        hybrid_state_key = pop_pending_hybrid_state_key(lookup_id)
+        msg_version = 1 if hybrid_state_key is not None else 0
+
         # NOTE(Jiayi): Tier 3 lookup is batched with retrieval.
         msg = BatchedLookupAndGetMsg(
             lookup_id=lookup_id,
             receiver_id=self.peer_init_url,
             keys=str_keys,
             mem_indexes=local_indexes,
+            hybrid_state_key=hybrid_state_key,
+            msg_version=msg_version,
         )
 
         retry_count = 0
@@ -642,6 +709,39 @@ class P2PBackend(StorageBackendInterface):
             num_hit_chunks = 0
         else:
             num_hit_chunks = ret_msg.num_hit_chunks
+
+            # ── Hybrid-state wire extension (receiver side) ─────────────────
+            # If the peer's reply includes a serialized hybrid-state payload
+            # AND we got at least one attention KV hit, decode it and store
+            # it in the integration layer's process-local LRU. The decode
+            # call goes through the registered codec; failure is benign (the
+            # scheduler's _get_hybrid_state_loadable_tokens returns 0 and
+            # recompute kicks in on the GDN layers, same as today's
+            # cross-instance behaviour).
+            #
+            # IMPORTANT: this must happen synchronously before we return,
+            # because the scheduler reads _HYBRID_STATE_CACHE on the very
+            # next call (_get_hybrid_state_loadable_tokens) to decide
+            # whether to report external-hit tokens to vLLM. If we deferred
+            # the store, the scheduler would see an empty LRU and discard
+            # the attention KV we just received.
+            hybrid_state_bytes = getattr(ret_msg, "hybrid_state_bytes", None)
+            if hybrid_state_bytes is not None and num_hit_chunks > 0:
+                stored = decode_and_store_hybrid_state(hybrid_state_bytes)
+                if stored:
+                    logger.info(
+                        "Received hybrid state from peer for lookup_id %s "
+                        "(%d bytes)",
+                        lookup_id,
+                        len(hybrid_state_bytes),
+                    )
+                else:
+                    logger.warning(
+                        "Hybrid state arrived but decoder rejected it "
+                        "(lookup_id %s, %d bytes); falling back to recompute",
+                        lookup_id,
+                        len(hybrid_state_bytes),
+                    )
 
         hit_mem_objs = mem_objs[:num_hit_chunks]
         for hit_mem_obj in hit_mem_objs:

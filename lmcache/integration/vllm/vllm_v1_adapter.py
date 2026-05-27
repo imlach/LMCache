@@ -46,6 +46,15 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.storage_backend.hybrid_state_wire import (
+    HybridStateTensorRecord,
+    HybridStateWirePayload,
+    WIRE_VERSION,
+    is_hybrid_state_codec_registered,
+    register_hybrid_state_codec,
+    set_pending_hybrid_state_key,
+)
+import msgspec
 
 if TYPE_CHECKING:
     # Third Party
@@ -366,6 +375,193 @@ def _largest_aligned_token_count(num_tokens: int, alignment: int) -> int:
     if alignment <= 0:
         return num_tokens
     return num_tokens // alignment * alignment
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Hybrid-state wire codec (cross-instance P2P transfer)
+# ───────────────────────────────────────────────────────────────────────────
+#
+# PR #3284 captures GDN/Mamba recurrent state in a process-local LRU
+# (``_HYBRID_STATE_CACHE``). For cross-instance prefix hits, the receiver's
+# LRU is empty and ``_get_hybrid_state_loadable_tokens`` reports 0 — the
+# attention KV that arrived via NIXL is silently wasted on hybrid layers.
+#
+# The codec functions below serialize a payload from the sender's LRU to
+# wire bytes, and deserialize wire bytes into the receiver's LRU. They are
+# registered as a process-global codec with the storage backend layer so
+# the P2P backend (which doesn't know about vLLM specifics) can call them
+# polymorphically.
+#
+# Wire schema: see ``lmcache.v1.storage_backend.hybrid_state_wire``.
+
+
+def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
+    """Extract raw bytes from a CPU tensor, dtype-agnostic.
+
+    bfloat16 has no numpy equivalent, so we reinterpret the underlying
+    storage as uint8 (lossless byte reinterpretation, no dtype conversion)
+    and use numpy's ``tobytes()``. Same approach works for float16, int8,
+    bfloat16, etc.
+    """
+    contig = tensor.contiguous()
+    if contig.device.type != "cpu":
+        contig = contig.cpu()
+    return contig.view(torch.uint8).numpy().tobytes()
+
+
+def _bytes_to_tensor(
+    data: bytes,
+    dtype: torch.dtype,
+    shape: list[int],
+) -> torch.Tensor:
+    """Reconstruct a CPU tensor from raw bytes + dtype + shape.
+
+    Uses ``torch.frombuffer`` over a writable ``bytearray`` (the underlying
+    ``bytes`` is immutable; ``frombuffer`` wants a writable buffer to be
+    safe across PyTorch versions). The buffer is then reinterpreted to the
+    target dtype and reshaped.
+    """
+    uint8_t = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+    return uint8_t.view(dtype).reshape(shape)
+
+
+def _dtype_to_wire_name(dtype: torch.dtype) -> str:
+    """Stable string name for a torch dtype that survives msgpack roundtrip."""
+    return str(dtype).removeprefix("torch.")
+
+
+def _wire_name_to_dtype(name: str) -> Optional[torch.dtype]:
+    """Resolve a wire-format dtype name to a torch.dtype, or None if unknown."""
+    return getattr(torch, name, None)
+
+
+def _encode_hybrid_state_for_wire(
+    key: tuple[int, str],
+) -> Optional[bytes]:
+    """Codec entry point: encode the local payload for ``key`` to wire bytes.
+
+    Registered with ``hybrid_state_wire.register_hybrid_state_codec`` at
+    module load. Returns ``None`` if the key is not in our LRU (the P2P
+    backend treats a None as a no-hybrid-state reply, which is the correct
+    fallback — the receiver will recompute on its GDN layers).
+    """
+    payload = _get_hybrid_state_payload(key)
+    if payload is None:
+        return None
+    try:
+        num_tokens, token_hash = key
+        records: list[HybridStateTensorRecord] = []
+        # Sort for deterministic wire ordering (helps debugging + cache hashing).
+        for (group_id, layer_name, state_index), tensor in sorted(payload.items()):
+            records.append(
+                HybridStateTensorRecord(
+                    group_id=group_id,
+                    layer_name=layer_name,
+                    state_index=state_index,
+                    shape=list(tensor.shape),
+                    dtype=_dtype_to_wire_name(tensor.dtype),
+                    data=_tensor_to_bytes(tensor),
+                )
+            )
+        wire = HybridStateWirePayload(
+            version=WIRE_VERSION,
+            num_tokens=num_tokens,
+            token_hash=token_hash,
+            tensors=records,
+        )
+        return msgspec.msgpack.encode(wire)
+    except Exception:
+        logger.warning(
+            "Failed to encode hybrid state for wire (key=%r); peer will recompute",
+            key,
+            exc_info=True,
+        )
+        return None
+
+
+def _decode_and_store_hybrid_state_from_wire(
+    payload_bytes: bytes,
+) -> bool:
+    """Codec entry point: decode wire bytes and store into local LRU.
+
+    Registered with ``hybrid_state_wire.register_hybrid_state_codec`` at
+    module load. Returns True if the payload was successfully decoded
+    AND stored. Returns False on version mismatch, decode failure, or
+    unknown dtype — caller (P2P backend) logs and lets the scheduler fall
+    back to recompute.
+
+    The byte budget used by ``_put_hybrid_state_payload`` is the same as
+    the local-store path; if the received payload exceeds it, the LRU
+    evicts older entries to make room.
+    """
+    try:
+        wire = msgspec.msgpack.decode(payload_bytes, type=HybridStateWirePayload)
+    except Exception:
+        logger.warning(
+            "msgpack decode failed for hybrid state payload; treating as miss",
+            exc_info=True,
+        )
+        return False
+
+    if wire.version != WIRE_VERSION:
+        logger.warning(
+            "Hybrid-state wire version mismatch (received %d, expected %d); "
+            "treating as miss",
+            wire.version,
+            WIRE_VERSION,
+        )
+        return False
+
+    payload: HybridStatePayload = {}
+    for rec in wire.tensors:
+        dtype = _wire_name_to_dtype(rec.dtype)
+        if dtype is None:
+            logger.warning(
+                "Unknown dtype %r in received hybrid state; treating as miss",
+                rec.dtype,
+            )
+            return False
+        try:
+            payload[(rec.group_id, rec.layer_name, rec.state_index)] = (
+                _bytes_to_tensor(rec.data, dtype, rec.shape)
+            )
+        except Exception:
+            logger.warning(
+                "Failed to reconstruct tensor (group=%d, layer=%r, idx=%d)",
+                rec.group_id,
+                rec.layer_name,
+                rec.state_index,
+                exc_info=True,
+            )
+            return False
+
+    key: HybridStateKey = (wire.num_tokens, wire.token_hash)
+    # Use a permissive byte cap here — the integration-layer paths that
+    # cap via ``max_local_cpu_size`` pass their value explicitly. For
+    # codec-driven inserts from the wire, we accept anything that fits in
+    # the live budget; eviction handles the rest. Pass 0 to mean
+    # "no extra cap beyond what's already in the LRU's accounting" — see
+    # ``_put_hybrid_state_payload`` (max_bytes=0 disables size-based
+    # eviction; we let the receiver's normal path enforce on next put).
+    _put_hybrid_state_payload(key, payload, max_bytes=0)
+
+    logger.info(
+        "Stored hybrid state from peer (%d tokens, %d tensor records, %d bytes wire)",
+        wire.num_tokens,
+        len(payload),
+        len(payload_bytes),
+    )
+    return True
+
+
+# Register at module import time. Idempotent under reimport (the registration
+# function logs and replaces). Both sender and receiver run this same module,
+# so both ends have the codec available — symmetric.
+if not is_hybrid_state_codec_registered():
+    register_hybrid_state_codec(
+        encoder=_encode_hybrid_state_for_wire,
+        decoder=_decode_and_store_hybrid_state_from_wire,
+    )
 
 
 @dataclass
@@ -1937,6 +2133,33 @@ class LMCacheConnectorV1Impl:
             request_configs = extract_request_configs(request.sampling_params)
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
+
+            # ── Hybrid-state wire extension: stash a candidate key for the
+            # P2P backend's outbound lookup. We compute the LARGEST aligned
+            # token count ≤ len(token_ids) and the matching blake2b hash.
+            # The P2P backend pops this from the broker (keyed by lookup_id)
+            # at the moment it builds BatchedLookupAndGetMsg; the sender
+            # uses it to look up its own _HYBRID_STATE_CACHE and attach the
+            # payload to the reply.
+            #
+            # If the sender doesn't have this exact aligned snapshot (e.g.
+            # the receiver guessed too large), no hybrid_state_bytes come
+            # back and the scheduler falls back to recompute on GDN layers.
+            # That's the safe default; a v2 of the wire format could send
+            # multiple candidate keys to handle longer-prefix mismatches.
+            if (
+                self.supports_mamba_external_kv
+                and self._hybrid_state_alignment_tokens > 0
+            ):
+                aligned_tokens = _largest_aligned_token_count(
+                    len(token_ids),
+                    self._hybrid_state_alignment_tokens,
+                )
+                if aligned_tokens > 0:
+                    set_pending_hybrid_state_key(
+                        req_id,
+                        _hybrid_state_key(token_ids, aligned_tokens),
+                    )
 
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
