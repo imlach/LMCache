@@ -39,6 +39,7 @@ from lmcache.utils import (
     compress_slot_mapping,
     convert_tokens_to_list,
 )
+from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
@@ -1482,6 +1483,73 @@ class LMCacheEngine:
             else:
                 return 0
         return self._clear(tokens, locations, request_configs)
+
+    @_lmcache_nvtx_annotate
+    def flush_all_to_controller(self) -> dict:
+        """Re-publish every locally-cached chunk-hash to the controller.
+
+        For each storage backend that owns a :class:`BatchedMessageSender`
+        (typically just :class:`LocalCPUBackend`), enqueue an
+        :attr:`OpType.ADMIT` for every key currently returned by
+        ``backend.get_keys()``, then call ``sender.flush()`` to drain the
+        pending message queue synchronously.
+
+        Why this exists: under steady-state the sender admits keys
+        opportunistically (on ``submit_put_task`` and on eviction) and the
+        background consumer drains in batches of
+        ``kv_msg_batch_size`` (default 50) or every ``kv_msg_batch_timeout``
+        (default 10 ms). For a workload that finishes a turn well before the
+        batch fills and immediately hands the prefix off to a peer instance
+        (the agentic-review T0→T1 tier-switch pattern), most of T0's admits
+        can still be sitting in the in-memory queue when T1 issues its
+        cross-instance lookup against the controller — T1 misses, prefills
+        cold, and the cross-instance KV transfer never fires for most of
+        the prefix. This method is the explicit "drain and re-admit" hook
+        the caller pokes at the handoff moment.
+
+        Idempotent: the controller deduplicates admits by
+        ``(instance_id, chunk_hash)`` (see
+        :class:`registration_controller.RegistrationController`), so calling
+        this repeatedly is safe.
+
+        Best-effort: backends without ``batched_msg_sender`` or
+        ``get_keys`` are skipped silently. ``sender.flush()`` blocks until
+        the background consumer drains the queue.
+
+        Returns:
+            A dict with shape::
+
+                {
+                  "instance_id": str,
+                  "backends": [
+                    {"location": str, "keys_admitted": int},
+                    ...
+                  ],
+                  "total_keys_admitted": int,
+                }
+        """
+        assert self.storage_manager is not None
+        backends_report: list = []
+        total = 0
+        for backend_name, backend in self.storage_manager.storage_backends.items():
+            sender = getattr(backend, "batched_msg_sender", None)
+            get_keys = getattr(backend, "get_keys", None)
+            if sender is None or not callable(get_keys):
+                continue
+            keys = get_keys()
+            for key in keys:
+                sender.add_kv_op(op_type=OpType.ADMIT, key=key.chunk_hash)
+            sender.flush()
+            keys_admitted = len(keys)
+            backends_report.append(
+                {"location": backend_name, "keys_admitted": keys_admitted}
+            )
+            total += keys_admitted
+        return {
+            "instance_id": self.config.lmcache_instance_id,
+            "backends": backends_report,
+            "total_keys_admitted": total,
+        }
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
