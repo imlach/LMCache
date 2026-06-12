@@ -1341,7 +1341,40 @@ class LMCacheConnectorV1Impl:
         group: HybridStateGroupSpec,
         num_tokens: int,
     ) -> Optional[int]:
-        """Return the vLLM block id that stores a hybrid state prefix."""
+        """Return the vLLM block id that holds a mamba/GDN group's recurrent state.
+
+        Mamba/GDN groups do NOT page recurrent state the way attention pages
+        KV. In vLLM v0.22.1 the per-request block list for a mamba group is the
+        manager's ``req_to_blocks[req_id]`` (surfaced as ``all_block_ids[gid]``),
+        and it holds exactly ONE live state page — the rest are the pool's null
+        block (``block_id == 0``):
+
+          - ``mamba_cache_mode == "none"`` (default): a single physical page per
+            request (+ ``num_speculative_blocks``); the state lives at the last
+            allocated block. ``MambaSpec.max_memory_usage_bytes`` →
+            ``page_size_bytes * (1 + num_speculative_blocks)``.
+            (vllm/v1/kv_cache_interface.py:582-591)
+          - ``mamba_cache_mode == "align"``: running state saved at the last
+            allocated block (recorded as ``last_state_block_idx``), earlier
+            indices padded with null blocks.
+            (vllm/v1/core/single_type_kv_cache_manager.py:1040-1084)
+
+        Either way the live recurrent state is the LAST non-null entry, because
+        the manager keeps only the state of the last computed token
+        (``get_num_skipped_tokens == num_computed_tokens - 1``,
+        single_type_kv_cache_manager.py:1092-1098) and the null block always has
+        ``block_id == 0`` (block_pool.py:173-177). Token-derived indexing
+        (``num_tokens // block_size - 1``) lands on a null padding page, which is
+        the round-2 capture failure: at 12544 tokens / block_size 1568 it picked
+        index 7, a null block, and the ``> 0`` guard rejected it.
+
+        Because the state page tracks the current computed head, capturing it
+        when ``request.token_ids`` covers exactly ``num_tokens`` (the aligned
+        boundary the KV chunks cover) snapshots the recurrent state for that
+        prefix — consistent with the alignment semantics the wire/P2P path
+        already relied on (P2P just transports whatever this local capture put
+        in the LRU under the same ``(num_tokens, hash)`` key).
+        """
         if (
             num_tokens <= 0
             or num_tokens % group.block_size != 0
@@ -1349,13 +1382,19 @@ class LMCacheConnectorV1Impl:
         ):
             return None
 
-        block_index = num_tokens // group.block_size - 1
         try:
-            block_id = request.all_block_ids[group.group_id][block_index]
+            group_block_ids = request.all_block_ids[group.group_id]
         except IndexError:
             return None
 
-        return block_id if block_id > 0 else None
+        # Walk back from the head to the last real (non-null) page. Null padding
+        # uses the pool's null block (id 0); the live recurrent state is the
+        # highest-index non-null entry.
+        for block_id in reversed(group_block_ids):
+            if block_id > 0:
+                return block_id
+
+        return None
 
     def _get_hybrid_state_page_tensors(
         self,
@@ -1432,15 +1471,26 @@ class LMCacheConnectorV1Impl:
         for group in self._hybrid_state_kv_cache_groups:
             block_id = self._get_hybrid_state_block_id(request, group, aligned_tokens)
             if block_id is None:
+                # Reaches here only when the mamba group's block list is empty or
+                # entirely null pages — i.e. vLLM never allocated a live recurrent
+                # state page for this prefix. That's a genuine anomaly now that we
+                # resolve the LAST non-null page rather than a token-derived index.
+                group_block_ids = (
+                    request.all_block_ids[group.group_id]
+                    if request.all_block_ids is not None
+                    and group.group_id < len(request.all_block_ids)
+                    else None
+                )
                 logger.warning(
                     "Request %s: cannot capture hybrid state for group %d at "
-                    "%d token(s) — no recurrent-state block id "
-                    "(all_block_ids present=%s, block_size=%d); GDN layers will "
-                    "recompute on a later prefix hit",
+                    "%d token(s) — no live recurrent-state page in the mamba "
+                    "block list (all_block_ids present=%s, group block count=%s, "
+                    "block_size=%d); GDN layers will recompute on a later prefix hit",
                     request.req_id,
                     group.group_id,
                     aligned_tokens,
                     request.all_block_ids is not None,
+                    len(group_block_ids) if group_block_ids is not None else None,
                     group.block_size,
                 )
                 return
