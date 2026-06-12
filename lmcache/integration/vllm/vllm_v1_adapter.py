@@ -46,6 +46,11 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.storage_backend.hybrid_state_disk import (
+    load_hybrid_state as _disk_load_hybrid_state,
+    remove_hybrid_state as _disk_remove_hybrid_state,
+    save_hybrid_state as _disk_save_hybrid_state,
+)
 from lmcache.v1.storage_backend.hybrid_state_wire import (
     HybridStateTensorRecord,
     HybridStateWirePayload,
@@ -54,6 +59,7 @@ from lmcache.v1.storage_backend.hybrid_state_wire import (
     register_hybrid_state_codec,
     set_pending_hybrid_state_key,
 )
+from lmcache.v1.storage_backend.path_sharder import PathSharder
 import msgspec
 
 if TYPE_CHECKING:
@@ -375,6 +381,36 @@ def _largest_aligned_token_count(num_tokens: int, alignment: int) -> int:
     if alignment <= 0:
         return num_tokens
     return num_tokens // alignment * alignment
+
+
+def _resolve_hybrid_state_disk_path(
+    config: LMCacheEngineConfig,
+    device: Any,
+) -> Optional[str]:
+    """Resolve the local-disk directory for persisting hybrid state.
+
+    Returns the per-worker directory ``LocalDiskBackend`` selects (same
+    ``PathSharder`` strategy, so hybrid artifacts and KV chunks co-locate),
+    or ``None`` when the local-disk backend is disabled or path resolution
+    fails (persistence is best-effort — the in-memory LRU still works).
+    """
+    if not config.local_disk or config.max_local_disk_size <= 0:
+        return None
+    try:
+        sharder = PathSharder(
+            raw_csv=config.local_disk,
+            strategy=config.local_disk_path_sharding,
+            dst_device=str(device),
+            create_dirs=True,
+        )
+        return sharder.selected
+    except Exception:
+        logger.warning(
+            "Could not resolve local-disk path for hybrid-state persistence; "
+            "restart survival disabled (in-memory LRU unaffected)",
+            exc_info=True,
+        )
+        return None
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -948,6 +984,13 @@ class LMCacheConnectorV1Impl:
         self._hybrid_state_cache_max_bytes = max(
             0, int(config.max_local_cpu_size * (1 << 30))
         )
+        # Local-disk persistence for hybrid state (restart survival). Resolve
+        # the SAME per-worker directory LocalDiskBackend writes KV chunks to,
+        # so hybrid artifacts land alongside the ``...@<chunkhash>@<dtype>.pt``
+        # files and share the disk's lifecycle. None when local disk is off.
+        self._hybrid_state_disk_path = _resolve_hybrid_state_disk_path(
+            config, self.device
+        )
         if (
             not self._loads_cover_all_kv_cache_groups
             and self._hybrid_state_kv_cache_groups
@@ -955,8 +998,9 @@ class LMCacheConnectorV1Impl:
             logger.info(
                 "LMCache will report external cache hits for hybrid models only "
                 "when matching local hybrid state is available. Hybrid state "
-                "byte limit: %d.",
+                "byte limit: %d. Disk persistence: %s.",
                 self._hybrid_state_cache_max_bytes,
+                self._hybrid_state_disk_path or "off",
             )
         elif not self._loads_cover_all_kv_cache_groups:
             logger.warning(
@@ -1377,6 +1421,7 @@ class LMCacheConnectorV1Impl:
             payload,
             self._hybrid_state_cache_max_bytes,
         )
+        self._persist_hybrid_state_to_disk(key)
         logger.info(
             "Stored hybrid state for request %s at %d token(s) across %d "
             "tensor page(s); evicted %d stale entries",
@@ -1385,6 +1430,46 @@ class LMCacheConnectorV1Impl:
             len(payload),
             evicted,
         )
+
+    def _persist_hybrid_state_to_disk(self, key: HybridStateKey) -> None:
+        """Persist a captured hybrid-state snapshot to local disk.
+
+        Reuses the wire codec's serialized form (the on-disk bytes are
+        identical to the P2P payload). Best-effort: a failure leaves the
+        in-memory LRU intact and only forfeits restart survival for this key.
+        """
+        if self._hybrid_state_disk_path is None:
+            return
+        payload_bytes = _encode_hybrid_state_for_wire(key)
+        if payload_bytes is None:
+            return
+        _disk_save_hybrid_state(self._hybrid_state_disk_path, key, payload_bytes)
+
+    def _ensure_hybrid_state_loaded(self, key: HybridStateKey) -> bool:
+        """Return whether ``key``'s hybrid state is available in the LRU.
+
+        On an in-memory miss, fall back to local disk: read the persisted
+        snapshot, decode it through the wire codec into the LRU, and report
+        success. This is the restart-survival path — after a process restart
+        the LRU is empty, but the on-disk artifact (written by a prior
+        process under the restart-stable blake2b key) repopulates it on the
+        first lookup that needs it.
+        """
+        if _get_hybrid_state_payload(key) is not None:
+            return True
+        if self._hybrid_state_disk_path is None:
+            return False
+        payload_bytes = _disk_load_hybrid_state(self._hybrid_state_disk_path, key)
+        if payload_bytes is None:
+            return False
+        # decode_and_store inserts into the LRU; byte accounting is enforced
+        # on the next capacity-bounded put, matching the wire-receive path.
+        if not _decode_and_store_hybrid_state_from_wire(payload_bytes):
+            # Corrupt / version-mismatched artifact: drop it so a future
+            # lookup doesn't keep paying the decode cost on a dead file.
+            _disk_remove_hybrid_state(self._hybrid_state_disk_path, key)
+            return False
+        return _get_hybrid_state_payload(key) is not None
 
     def _load_hybrid_state(self, request: ReqMeta) -> bool:
         """Load cached opaque hybrid state pages into vLLM state blocks."""
@@ -1396,6 +1481,10 @@ class LMCacheConnectorV1Impl:
 
         num_tokens = request.load_spec.lmcache_cached_tokens
         key = _hybrid_state_key(request.token_ids, num_tokens)
+        # Restart-survival path: repopulate from disk if the LRU was evicted
+        # (or never held this prefix in this process). No-op cost when the
+        # gate already loaded it in-memory just before.
+        self._ensure_hybrid_state_loaded(key)
         payload = _get_hybrid_state_payload(key)
         if payload is None:
             logger.error(
@@ -1477,7 +1566,7 @@ class LMCacheConnectorV1Impl:
         )
         while aligned_tokens > 0:
             key = _hybrid_state_key(token_ids, aligned_tokens)
-            if _get_hybrid_state_payload(key) is not None:
+            if self._ensure_hybrid_state_loaded(key):
                 return aligned_tokens
             aligned_tokens -= self._hybrid_state_alignment_tokens
 
