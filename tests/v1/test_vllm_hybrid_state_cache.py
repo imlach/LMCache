@@ -17,6 +17,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     _hybrid_state_payload_nbytes,
     _put_hybrid_state_payload,
 )
+from lmcache.v1.storage_backend.hybrid_state_disk import (
+    hybrid_state_path,
+    is_hybrid_state_file,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -112,6 +116,158 @@ def test_hybrid_state_group_selection_keeps_full_attention_for_lmcache() -> None
     ]
 
 
+def _make_block_id_connector() -> LMCacheConnectorV1Impl:
+    """A bare connector with one mamba group, block_size 1568 (the on-cluster
+    Qwen3.6-27B GDN shape)."""
+    connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    connector._hybrid_state_kv_cache_groups = (
+        HybridStateGroupSpec(0, ("mamba0",), 1568, 6),
+    )
+    connector._hybrid_state_alignment_tokens = 1568
+    return connector
+
+
+def test_get_hybrid_state_block_id_picks_last_non_null_for_padded_mamba_list() -> None:
+    """Mirror the real vLLM v0.22.1 mamba block-table shape: ``req_to_blocks``
+    for a mamba group (mamba_cache_mode "none"/"align") is a null-padded list
+    with the single live recurrent-state page at the END — null pages all carry
+    block_id 0 (block_pool.py:173-177). For a 16,611-token request at the 12544
+    aligned boundary (8 * 1568), the live state is block 42, NOT the
+    token-derived index 7 (which lands on a null block). Regression guard for
+    the round-2 capture failure.
+    """
+    connector = _make_block_id_connector()
+    # 8 entries: indices 0..6 are null padding (id 0), the live state is at the
+    # last index. This is what get_blocks() returns for a mamba group at this
+    # prefix (single_type_kv_cache_manager.py:1040-1084, get_num_skipped_tokens
+    # at :1092-1098).
+    mamba_block_ids = [0, 0, 0, 0, 0, 0, 0, 42]
+    request = ReqMeta(
+        req_id="req-padded",
+        token_ids=list(range(16611)),
+        slot_mapping=torch.arange(1, dtype=torch.long),
+        all_block_ids=(mamba_block_ids,),
+    )
+
+    group = connector._hybrid_state_kv_cache_groups[0]
+    assert connector._get_hybrid_state_block_id(request, group, 12544) == 42
+
+
+def test_get_hybrid_state_block_id_single_live_page_none_mode() -> None:
+    """mamba_cache_mode "none" (default): one physical page per request, so the
+    block list is mostly nulls with a single real id. The resolver returns that
+    id regardless of how far back it sits."""
+    connector = _make_block_id_connector()
+    request = ReqMeta(
+        req_id="req-none-mode",
+        token_ids=list(range(3 * 1568)),
+        slot_mapping=torch.arange(1, dtype=torch.long),
+        all_block_ids=([0, 0, 17],),
+    )
+    group = connector._hybrid_state_kv_cache_groups[0]
+    assert connector._get_hybrid_state_block_id(request, group, 3 * 1568) == 17
+
+
+def test_get_hybrid_state_block_id_none_when_all_blocks_null() -> None:
+    """An all-null block list (no live recurrent-state page allocated) yields
+    None so capture skips with the anomaly WARN rather than reading a null
+    page."""
+    connector = _make_block_id_connector()
+    request = ReqMeta(
+        req_id="req-all-null",
+        token_ids=list(range(2 * 1568)),
+        slot_mapping=torch.arange(1, dtype=torch.long),
+        all_block_ids=([0, 0],),
+    )
+    group = connector._hybrid_state_kv_cache_groups[0]
+    assert connector._get_hybrid_state_block_id(request, group, 2 * 1568) is None
+
+
+def test_get_hybrid_state_block_id_none_for_unaligned_or_missing() -> None:
+    """Guards: unaligned token count, missing block ids, and out-of-range group
+    id all return None."""
+    connector = _make_block_id_connector()
+    group = connector._hybrid_state_kv_cache_groups[0]
+
+    unaligned = ReqMeta(
+        req_id="req-unaligned",
+        token_ids=list(range(1600)),
+        slot_mapping=torch.arange(1, dtype=torch.long),
+        all_block_ids=([0, 9],),
+    )
+    # 1600 is not a multiple of block_size 1568.
+    assert connector._get_hybrid_state_block_id(request=unaligned, group=group,
+                                                num_tokens=1600) is None
+
+    no_blocks = ReqMeta(
+        req_id="req-no-blocks",
+        token_ids=list(range(1568)),
+        slot_mapping=torch.arange(1, dtype=torch.long),
+        all_block_ids=None,
+    )
+    assert connector._get_hybrid_state_block_id(no_blocks, group, 1568) is None
+
+    # Group id out of range (only one block-id group present, group_id is 0,
+    # but synthesize a spec whose group_id exceeds the list).
+    oor_group = HybridStateGroupSpec(5, ("mamba5",), 1568, 6)
+    in_range = ReqMeta(
+        req_id="req-oor",
+        token_ids=list(range(1568)),
+        slot_mapping=torch.arange(1, dtype=torch.long),
+        all_block_ids=([0, 3],),
+    )
+    assert connector._get_hybrid_state_block_id(in_range, oor_group, 1568) is None
+
+
+def test_store_and_load_round_trips_padded_mamba_block_list(tmp_path) -> None:
+    """End-to-end capture+restore using the real null-padded mamba block-table
+    shape: the live state page sits at the last (non-null) block id, and capture
+    must read/write THAT page — not a token-derived index. Page tensors are
+    sized so the live block id indexes a valid row."""
+    token_ids = list(range(2 * 1568))
+    # 4 physical pages; the live mamba state for this request is page id 3.
+    conv_state_pages = torch.arange(16, dtype=torch.int8).reshape(4, 4)
+    ssm_state_pages = (torch.arange(8, dtype=torch.int8) + 20).reshape(4, 2)
+    connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    connector._hybrid_state_kv_cache_groups = (
+        HybridStateGroupSpec(0, ("mamba0",), 1568, 6),
+    )
+    connector._hybrid_state_alignment_tokens = 1568
+    connector._hybrid_state_cache_max_bytes = 1024
+    connector._hybrid_state_disk_path = None
+    connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
+    # Null-padded list: only the last entry (id 3) is the live state page.
+    request = ReqMeta(
+        req_id="req-padded-rt",
+        token_ids=token_ids,
+        slot_mapping=torch.arange(1, dtype=torch.long),
+        all_block_ids=([0, 3],),
+    )
+
+    connector._store_hybrid_state(request)
+    payload = _get_hybrid_state_payload(_hybrid_state_key(token_ids, 2 * 1568))
+    assert payload is not None
+    # Captured the live page (id 3), not a null/token-derived page.
+    assert torch.equal(
+        payload[(0, "mamba0", 0)].view(torch.int8),
+        torch.tensor([12, 13, 14, 15], dtype=torch.int8),
+    )
+
+    # Corrupt the live pages, then restore from the captured payload.
+    conv_state_pages[3].fill_(0)
+    ssm_state_pages[3].fill_(0)
+    request.load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=2 * 1568,
+        can_load=True,
+    )
+    assert connector._load_hybrid_state(request)
+    assert torch.equal(
+        conv_state_pages[3], torch.tensor([12, 13, 14, 15], dtype=torch.int8)
+    )
+    assert torch.equal(ssm_state_pages[3], torch.tensor([26, 27], dtype=torch.int8))
+
+
 def test_hybrid_state_hit_is_not_loadable_when_state_is_missing() -> None:
     connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     connector._hybrid_state_kv_cache_groups = (
@@ -137,6 +293,7 @@ def test_hybrid_state_store_and_load_round_trips_raw_pages() -> None:
     )
     connector._hybrid_state_alignment_tokens = 4
     connector._hybrid_state_cache_max_bytes = 1024
+    connector._hybrid_state_disk_path = None
     connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
     request = ReqMeta(
         req_id="req-1",
@@ -150,8 +307,10 @@ def test_hybrid_state_store_and_load_round_trips_raw_pages() -> None:
     assert payload is not None
     assert set(payload) == {(0, "mamba0", 0), (0, "mamba0", 1)}
 
-    conv_state_pages[1].fill_(0)
-    ssm_state_pages[1].fill_(0)
+    # The resolver reads the LAST non-null block (id 2), the live recurrent-state
+    # page — not index 0. Page-tensor row 2 holds the live state.
+    conv_state_pages[2].fill_(0)
+    ssm_state_pages[2].fill_(0)
     request.load_spec = LoadSpec(
         vllm_cached_tokens=0,
         lmcache_cached_tokens=4,
@@ -160,6 +319,117 @@ def test_hybrid_state_store_and_load_round_trips_raw_pages() -> None:
 
     assert connector._load_hybrid_state(request)
     assert torch.equal(
-        conv_state_pages[1], torch.tensor([8, 9, 10, 11], dtype=torch.int8)
+        conv_state_pages[2], torch.tensor([12, 13, 14, 15], dtype=torch.int8)
     )
-    assert torch.equal(ssm_state_pages[1], torch.tensor([24, 25], dtype=torch.int8))
+    assert torch.equal(ssm_state_pages[2], torch.tensor([26, 27], dtype=torch.int8))
+
+
+def _make_capture_connector(disk_path, max_bytes=1024):
+    """A bare connector wired for hybrid-state capture (one mamba group)."""
+    connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    connector._hybrid_state_kv_cache_groups = (
+        HybridStateGroupSpec(0, ("mamba0",), 4, 6),
+    )
+    connector._hybrid_state_alignment_tokens = 4
+    connector._hybrid_state_cache_max_bytes = max_bytes
+    connector._hybrid_state_disk_path = disk_path
+    return connector
+
+
+def test_store_hybrid_state_persists_artifact_to_disk(tmp_path) -> None:
+    """Capture on the normal store path must write a disk artifact keyed by
+    the blake2b hybrid key — the restart-survival producer in plain local
+    (non-P2P) operation."""
+    token_ids = [10, 11, 12, 13]
+    conv_state_pages = torch.arange(16, dtype=torch.int8).reshape(4, 4)[1:]
+    ssm_state_pages = (torch.arange(8, dtype=torch.int8) + 20).reshape(4, 2)[1:]
+    connector = _make_capture_connector(str(tmp_path))
+    connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
+    request = ReqMeta(
+        req_id="req-disk",
+        token_ids=token_ids,
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=([1, 2],),
+    )
+
+    connector._store_hybrid_state(request)
+
+    key = _hybrid_state_key(token_ids, 4)
+    # In-memory LRU populated...
+    assert _get_hybrid_state_payload(key) is not None
+    # ...and a single greppable @hybrid artifact landed on disk.
+    artifacts = [p.name for p in tmp_path.iterdir() if is_hybrid_state_file(p.name)]
+    assert artifacts == [hybrid_state_path(str(tmp_path), key).split("/")[-1]]
+
+
+def test_disk_artifact_repopulates_lru_after_restart(tmp_path) -> None:
+    """After a process restart the LRU is empty; the on-disk artifact written
+    by a prior process must repopulate it on the first lookup (the smoking-gun
+    path: the hit-gate reported 0 matching hybrid state before this worked)."""
+    token_ids = [10, 11, 12, 13]
+    conv_state_pages = torch.arange(16, dtype=torch.int8).reshape(4, 4)[1:]
+    ssm_state_pages = (torch.arange(8, dtype=torch.int8) + 20).reshape(4, 2)[1:]
+    connector = _make_capture_connector(str(tmp_path))
+    connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
+    request = ReqMeta(
+        req_id="req-restart",
+        token_ids=token_ids,
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=([1, 2],),
+    )
+    connector._store_hybrid_state(request)
+
+    key = _hybrid_state_key(token_ids, 4)
+
+    # Simulate the engine-process restart: the in-memory LRU is wiped, but the
+    # disk artifact survives.
+    with vllm_v1_adapter._HYBRID_STATE_CACHE_LOCK:
+        vllm_v1_adapter._HYBRID_STATE_CACHE.clear()
+        vllm_v1_adapter._HYBRID_STATE_CACHE_BYTES = 0
+    assert _get_hybrid_state_payload(key) is None
+
+    # The gate's per-key reload pulls it back in from disk, token-exact.
+    assert connector._ensure_hybrid_state_loaded(key)
+    payload = _get_hybrid_state_payload(key)
+    assert payload is not None
+    assert set(payload) == {(0, "mamba0", 0), (0, "mamba0", 1)}
+
+
+def test_store_hybrid_state_no_disk_path_keeps_memory_only(tmp_path) -> None:
+    """With disk persistence off, capture still populates the in-memory LRU
+    and writes nothing to disk (best-effort persistence is decoupled from
+    capture)."""
+    token_ids = [10, 11, 12, 13]
+    conv_state_pages = torch.arange(16, dtype=torch.int8).reshape(4, 4)[1:]
+    ssm_state_pages = (torch.arange(8, dtype=torch.int8) + 20).reshape(4, 2)[1:]
+    connector = _make_capture_connector(disk_path=None)
+    connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
+    request = ReqMeta(
+        req_id="req-nodisk",
+        token_ids=token_ids,
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=([1, 2],),
+    )
+
+    connector._store_hybrid_state(request)
+
+    assert _get_hybrid_state_payload(_hybrid_state_key(token_ids, 4)) is not None
+    assert not any(is_hybrid_state_file(p.name) for p in tmp_path.iterdir())
+
+
+def test_store_hybrid_state_skips_when_block_id_missing(tmp_path) -> None:
+    """A prefix with no recurrent-state block (all_block_ids=None) must skip
+    capture without raising and without writing an artifact."""
+    connector = _make_capture_connector(str(tmp_path))
+    connector._all_kv_caches = {"mamba0": [torch.zeros(4, 4, dtype=torch.int8)]}
+    request = ReqMeta(
+        req_id="req-noblock",
+        token_ids=[10, 11, 12, 13],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=None,
+    )
+
+    connector._store_hybrid_state(request)
+
+    assert _get_hybrid_state_payload(_hybrid_state_key([10, 11, 12, 13], 4)) is None
+    assert not any(is_hybrid_state_file(p.name) for p in tmp_path.iterdir())
