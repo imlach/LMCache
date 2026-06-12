@@ -240,8 +240,20 @@ def _is_hybrid_state_kv_cache_spec(kv_cache_spec: Any) -> bool:
 
 
 def _get_parent_kv_cache_config(parent: KVConnectorBase_V1) -> Optional[Any]:
-    """Get vLLM's KV cache config from connector parents that expose it."""
-    return getattr(parent, "kv_cache_config", None)
+    """Get vLLM's KV cache config from connector parents that expose it.
+
+    vLLM's ``KVConnectorBase_V1`` stores the config the factory passes it as
+    the private ``_kv_cache_config`` (some builds also surface a public
+    ``kv_cache_config``). Both the scheduler- and worker-role connectors are
+    constructed with the same config, so reading either gives the hybrid-state
+    capture path (worker) the same group view the hit-gate (scheduler) sees —
+    without it, ``_select_hybrid_state_kv_cache_groups`` returns ``()`` in the
+    worker and ``_store_hybrid_state`` silently no-ops on every store.
+    """
+    config = getattr(parent, "kv_cache_config", None)
+    if config is not None:
+        return config
+    return getattr(parent, "_kv_cache_config", None)
 
 
 def _select_lmcache_kv_cache_group(
@@ -1376,8 +1388,19 @@ class LMCacheConnectorV1Impl:
         return tuple(page_tensors)
 
     def _store_hybrid_state(self, request: ReqMeta) -> None:
-        """Store opaque hybrid state pages for a completed aligned prefix."""
+        """Capture + persist opaque hybrid state pages for an aligned prefix.
+
+        Runs worker-side on the normal store path (``wait_for_save``), not the
+        P2P path — plain local capture is the only producer of the in-memory
+        LRU snapshots that the wire codec serializes and that disk persistence
+        writes for restart survival. Every skip is logged with a reason so a
+        cluster run can grep ``hybrid state`` to see exactly which precondition
+        the GDN/Mamba prefix missed (e.g. groups not visible to the worker, an
+        unaligned chunk, or a missing recurrent-state block).
+        """
         if not self.supports_mamba_external_kv:
+            # No hybrid groups visible to this connector (pure-attention model,
+            # or the worker never resolved kv_cache_config). Not an error.
             return
 
         aligned_tokens = _largest_aligned_token_count(
@@ -1385,16 +1408,41 @@ class LMCacheConnectorV1Impl:
             self._hybrid_state_alignment_tokens,
         )
         if aligned_tokens <= 0:
+            logger.debug(
+                "Request %s: no hybrid state stored, prefix of %d token(s) is "
+                "shorter than one aligned unit (%d)",
+                request.req_id,
+                len(request.token_ids),
+                self._hybrid_state_alignment_tokens,
+            )
             return
 
         key = _hybrid_state_key(request.token_ids, aligned_tokens)
         if _get_hybrid_state_payload(key) is not None:
+            logger.debug(
+                "Request %s: hybrid state for %d token(s) already cached "
+                "(key=%s); skipping re-capture",
+                request.req_id,
+                aligned_tokens,
+                key[1],
+            )
             return
 
         payload: HybridStatePayload = {}
         for group in self._hybrid_state_kv_cache_groups:
             block_id = self._get_hybrid_state_block_id(request, group, aligned_tokens)
             if block_id is None:
+                logger.warning(
+                    "Request %s: cannot capture hybrid state for group %d at "
+                    "%d token(s) — no recurrent-state block id "
+                    "(all_block_ids present=%s, block_size=%d); GDN layers will "
+                    "recompute on a later prefix hit",
+                    request.req_id,
+                    group.group_id,
+                    aligned_tokens,
+                    request.all_block_ids is not None,
+                    group.block_size,
+                )
                 return
 
             for layer_name in group.layer_names:
@@ -1404,11 +1452,12 @@ class LMCacheConnectorV1Impl:
                 ):
                     logger.warning(
                         "Request %s cannot store hybrid state for group %d, "
-                        "layer %s, block %d",
+                        "layer %s, block %d (page tensors present=%s)",
                         request.req_id,
                         group.group_id,
                         layer_name,
                         block_id,
+                        page_tensors is not None,
                     )
                     return
                 for state_index, page_tensor in enumerate(page_tensors):
@@ -1421,15 +1470,16 @@ class LMCacheConnectorV1Impl:
             payload,
             self._hybrid_state_cache_max_bytes,
         )
-        self._persist_hybrid_state_to_disk(key)
         logger.info(
-            "Stored hybrid state for request %s at %d token(s) across %d "
-            "tensor page(s); evicted %d stale entries",
+            "Captured hybrid state for request %s at %d token(s) (key=%s) "
+            "across %d tensor page(s); evicted %d stale entries",
             request.req_id,
             aligned_tokens,
+            key[1],
             len(payload),
             evicted,
         )
+        self._persist_hybrid_state_to_disk(key)
 
     def _persist_hybrid_state_to_disk(self, key: HybridStateKey) -> None:
         """Persist a captured hybrid-state snapshot to local disk.
@@ -1437,13 +1487,32 @@ class LMCacheConnectorV1Impl:
         Reuses the wire codec's serialized form (the on-disk bytes are
         identical to the P2P payload). Best-effort: a failure leaves the
         in-memory LRU intact and only forfeits restart survival for this key.
+        Logs the key/bytes/path on success and a reason on every skip so a
+        cluster run can grade restart survival from the worker log alone.
         """
         if self._hybrid_state_disk_path is None:
+            logger.warning(
+                "Hybrid state for key=%s captured in memory but NOT persisted: "
+                "local-disk path unresolved (local_disk set + "
+                "max_local_disk_size > 0 required); restart survival disabled",
+                key[1],
+            )
             return
         payload_bytes = _encode_hybrid_state_for_wire(key)
         if payload_bytes is None:
+            logger.warning(
+                "Hybrid state for key=%s could not be encoded for persistence "
+                "(codec returned None); restart survival lost for this key",
+                key[1],
+            )
             return
-        _disk_save_hybrid_state(self._hybrid_state_disk_path, key, payload_bytes)
+        if _disk_save_hybrid_state(self._hybrid_state_disk_path, key, payload_bytes):
+            logger.info(
+                "Persisted hybrid state to disk: key=%s, %d bytes, dir=%s",
+                key[1],
+                len(payload_bytes),
+                self._hybrid_state_disk_path,
+            )
 
     def _ensure_hybrid_state_loaded(self, key: HybridStateKey) -> bool:
         """Return whether ``key``'s hybrid state is available in the LRU.

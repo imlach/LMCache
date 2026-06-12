@@ -17,6 +17,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     _hybrid_state_payload_nbytes,
     _put_hybrid_state_payload,
 )
+from lmcache.v1.storage_backend.hybrid_state_disk import (
+    hybrid_state_path,
+    is_hybrid_state_file,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -137,6 +141,7 @@ def test_hybrid_state_store_and_load_round_trips_raw_pages() -> None:
     )
     connector._hybrid_state_alignment_tokens = 4
     connector._hybrid_state_cache_max_bytes = 1024
+    connector._hybrid_state_disk_path = None
     connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
     request = ReqMeta(
         req_id="req-1",
@@ -163,3 +168,114 @@ def test_hybrid_state_store_and_load_round_trips_raw_pages() -> None:
         conv_state_pages[1], torch.tensor([8, 9, 10, 11], dtype=torch.int8)
     )
     assert torch.equal(ssm_state_pages[1], torch.tensor([24, 25], dtype=torch.int8))
+
+
+def _make_capture_connector(disk_path, max_bytes=1024):
+    """A bare connector wired for hybrid-state capture (one mamba group)."""
+    connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    connector._hybrid_state_kv_cache_groups = (
+        HybridStateGroupSpec(0, ("mamba0",), 4, 6),
+    )
+    connector._hybrid_state_alignment_tokens = 4
+    connector._hybrid_state_cache_max_bytes = max_bytes
+    connector._hybrid_state_disk_path = disk_path
+    return connector
+
+
+def test_store_hybrid_state_persists_artifact_to_disk(tmp_path) -> None:
+    """Capture on the normal store path must write a disk artifact keyed by
+    the blake2b hybrid key — the restart-survival producer in plain local
+    (non-P2P) operation."""
+    token_ids = [10, 11, 12, 13]
+    conv_state_pages = torch.arange(16, dtype=torch.int8).reshape(4, 4)[1:]
+    ssm_state_pages = (torch.arange(8, dtype=torch.int8) + 20).reshape(4, 2)[1:]
+    connector = _make_capture_connector(str(tmp_path))
+    connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
+    request = ReqMeta(
+        req_id="req-disk",
+        token_ids=token_ids,
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=([1, 2],),
+    )
+
+    connector._store_hybrid_state(request)
+
+    key = _hybrid_state_key(token_ids, 4)
+    # In-memory LRU populated...
+    assert _get_hybrid_state_payload(key) is not None
+    # ...and a single greppable @hybrid artifact landed on disk.
+    artifacts = [p.name for p in tmp_path.iterdir() if is_hybrid_state_file(p.name)]
+    assert artifacts == [hybrid_state_path(str(tmp_path), key).split("/")[-1]]
+
+
+def test_disk_artifact_repopulates_lru_after_restart(tmp_path) -> None:
+    """After a process restart the LRU is empty; the on-disk artifact written
+    by a prior process must repopulate it on the first lookup (the smoking-gun
+    path: the hit-gate reported 0 matching hybrid state before this worked)."""
+    token_ids = [10, 11, 12, 13]
+    conv_state_pages = torch.arange(16, dtype=torch.int8).reshape(4, 4)[1:]
+    ssm_state_pages = (torch.arange(8, dtype=torch.int8) + 20).reshape(4, 2)[1:]
+    connector = _make_capture_connector(str(tmp_path))
+    connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
+    request = ReqMeta(
+        req_id="req-restart",
+        token_ids=token_ids,
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=([1, 2],),
+    )
+    connector._store_hybrid_state(request)
+
+    key = _hybrid_state_key(token_ids, 4)
+
+    # Simulate the engine-process restart: the in-memory LRU is wiped, but the
+    # disk artifact survives.
+    with vllm_v1_adapter._HYBRID_STATE_CACHE_LOCK:
+        vllm_v1_adapter._HYBRID_STATE_CACHE.clear()
+        vllm_v1_adapter._HYBRID_STATE_CACHE_BYTES = 0
+    assert _get_hybrid_state_payload(key) is None
+
+    # The gate's per-key reload pulls it back in from disk, token-exact.
+    assert connector._ensure_hybrid_state_loaded(key)
+    payload = _get_hybrid_state_payload(key)
+    assert payload is not None
+    assert set(payload) == {(0, "mamba0", 0), (0, "mamba0", 1)}
+
+
+def test_store_hybrid_state_no_disk_path_keeps_memory_only(tmp_path) -> None:
+    """With disk persistence off, capture still populates the in-memory LRU
+    and writes nothing to disk (best-effort persistence is decoupled from
+    capture)."""
+    token_ids = [10, 11, 12, 13]
+    conv_state_pages = torch.arange(16, dtype=torch.int8).reshape(4, 4)[1:]
+    ssm_state_pages = (torch.arange(8, dtype=torch.int8) + 20).reshape(4, 2)[1:]
+    connector = _make_capture_connector(disk_path=None)
+    connector._all_kv_caches = {"mamba0": [conv_state_pages, ssm_state_pages]}
+    request = ReqMeta(
+        req_id="req-nodisk",
+        token_ids=token_ids,
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=([1, 2],),
+    )
+
+    connector._store_hybrid_state(request)
+
+    assert _get_hybrid_state_payload(_hybrid_state_key(token_ids, 4)) is not None
+    assert not any(is_hybrid_state_file(p.name) for p in tmp_path.iterdir())
+
+
+def test_store_hybrid_state_skips_when_block_id_missing(tmp_path) -> None:
+    """A prefix with no recurrent-state block (all_block_ids=None) must skip
+    capture without raising and without writing an artifact."""
+    connector = _make_capture_connector(str(tmp_path))
+    connector._all_kv_caches = {"mamba0": [torch.zeros(4, 4, dtype=torch.int8)]}
+    request = ReqMeta(
+        req_id="req-noblock",
+        token_ids=[10, 11, 12, 13],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        all_block_ids=None,
+    )
+
+    connector._store_hybrid_state(request)
+
+    assert _get_hybrid_state_payload(_hybrid_state_key([10, 11, 12, 13], 4)) is None
+    assert not any(is_hybrid_state_file(p.name) for p in tmp_path.iterdir())
