@@ -116,6 +116,51 @@ def test_hybrid_state_group_selection_keeps_full_attention_for_lmcache() -> None
     ]
 
 
+def test_hybrid_state_group_selection_ignores_speculative_attention_specs() -> None:
+    class Qwen3MTPAttentionSpec:
+        block_size = 16
+        page_size_bytes = 64
+
+    class EagleSpec:
+        block_size = 16
+        page_size_bytes = 64
+
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 4),),
+        dtypes=(torch.float16,),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mamba0"], mamba_spec),
+            KVCacheGroupSpec(["mtp0"], Qwen3MTPAttentionSpec()),
+            KVCacheGroupSpec(["eagle0"], EagleSpec()),
+        ],
+    )
+
+    hybrid_groups = vllm_v1_adapter._select_hybrid_state_kv_cache_groups(
+        kv_cache_config
+    )
+
+    assert [group.group_id for group in hybrid_groups] == [0]
+    assert [group.layer_names for group in hybrid_groups] == [("mamba0",)]
+
+
+def test_unknown_kv_cache_specs_are_not_treated_as_hybrid_state(caplog) -> None:
+    class FutureDraftCacheSpec:
+        pass
+
+    with caplog.at_level("WARNING"):
+        is_hybrid = vllm_v1_adapter._is_hybrid_state_kv_cache_spec(
+            FutureDraftCacheSpec()
+        )
+
+    assert not is_hybrid
+    assert "Unknown vLLM KV cache spec" in caplog.text
+
+
 def _make_block_id_connector() -> LMCacheConnectorV1Impl:
     """A bare connector with one mamba group, block_size 1568 (the on-cluster
     Qwen3.6-27B GDN shape)."""

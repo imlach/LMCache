@@ -192,6 +192,24 @@ _NON_RECURRENT_KV_CACHE_KINDS = _ATTENTION_KV_CACHE_KINDS | {
     "cross_attention",
     "encoder_only_attention",
 }
+_NON_RECURRENT_SPEC_NAME_MARKERS = (
+    "Attention",
+    "CrossAttention",
+    "Encoder",
+    "Eagle",
+    "EAGLE",
+    "MLA",
+    "MTP",
+    "SpecDecode",
+    "Speculative",
+    "TQ",
+)
+_RECURRENT_SPEC_NAME_MARKERS = (
+    "GDN",
+    "LinearAttention",
+    "Mamba",
+    "Recurrent",
+)
 _KV_CACHE_SPEC_KIND_BY_NAME = {
     "ChunkedLocalAttentionSpec": "chunked_local_attention",
     "CrossAttentionSpec": "cross_attention",
@@ -236,7 +254,18 @@ def _is_hybrid_state_kv_cache_spec(kv_cache_spec: Any) -> bool:
         return bool(specs) and all(
             _is_hybrid_state_kv_cache_spec(spec) for spec in specs.values()
         )
-    return spec_name.endswith("Spec")
+    if any(marker in spec_name for marker in _NON_RECURRENT_SPEC_NAME_MARKERS):
+        return False
+    if any(marker in spec_name for marker in _RECURRENT_SPEC_NAME_MARKERS):
+        return True
+
+    logger.warning(
+        "Unknown vLLM KV cache spec %s; treating it as non-recurrent. "
+        "If this is a GDN/Mamba-style recurrent spec, add it to LMCache's "
+        "hybrid-state classifier before relying on external KV loads.",
+        spec_name,
+    )
+    return False
 
 
 def _get_parent_kv_cache_config(parent: KVConnectorBase_V1) -> Optional[Any]:
