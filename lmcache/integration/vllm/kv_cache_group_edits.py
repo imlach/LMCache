@@ -73,6 +73,19 @@ _SUBPAGEABLE_ATTENTION_KINDS = frozenset(
     }
 )
 
+_NON_RECURRENT_SPEC_NAME_MARKERS = (
+    "Attention",
+    "CrossAttention",
+    "Encoder",
+    "Eagle",
+    "EAGLE",
+    "MLA",
+    "MTP",
+    "SpecDecode",
+    "Speculative",
+    "TQ",
+)
+
 
 def _declares_slot_compression(spec: KVCacheSpec) -> bool:
     """Return whether a spec declares slot compression (must not be edited).
@@ -92,6 +105,27 @@ def _leaf_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
     if isinstance(inner, dict):
         return list(inner.values())
     return [spec]
+
+
+def _classify_kv_cache_spec_kind(spec: KVCacheSpec) -> KVCacheSpecKind:
+    """Classify vLLM KV cache specs with explicit speculative-spec handling."""
+    kind = get_kv_cache_spec_kind(spec)
+    if kind != KVCacheSpecKind.UNKNOWN:
+        return kind
+
+    spec_name = type(spec).__name__
+    if any(marker in spec_name for marker in _NON_RECURRENT_SPEC_NAME_MARKERS):
+        logger.debug("Treating vLLM KV cache spec %s as non-recurrent", spec_name)
+        return KVCacheSpecKind.UNKNOWN
+
+    if spec_name.endswith("Spec"):
+        raise ValueError(
+            f"Unknown vLLM KV cache spec {spec_name}; LMCache does not know "
+            "whether it carries reusable recurrent state. Add it to "
+            "kv_cache_group_edits.py before relying on external KV loads."
+        )
+
+    return KVCacheSpecKind.UNKNOWN
 
 
 def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
@@ -120,7 +154,11 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
     unsupported: list[str] = []
     for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
         for spec in _leaf_specs(group.kv_cache_spec):
-            kind = get_kv_cache_spec_kind(spec)
+            try:
+                kind = _classify_kv_cache_spec_kind(spec)
+            except ValueError as exc:
+                unsupported.append(f"group {group_idx}: {exc}")
+                continue
             if kind == KVCacheSpecKind.CROSS_ATTENTION:
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
             elif (
@@ -216,7 +254,7 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
     name = "mamba-page-view"
 
     def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
-        return get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
+        return _classify_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
 
     def apply(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> torch.Tensor:
         # vLLM lays out one padded page per block as (conv | ssm | pad), and
@@ -280,7 +318,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
         return (
             # Standard-paged attention only; MLA layouts and declared slot
             # compression (DeepSeek) belong to other transfer paths.
-            get_kv_cache_spec_kind(spec) in _SUBPAGEABLE_ATTENTION_KINDS
+            _classify_kv_cache_spec_kind(spec) in _SUBPAGEABLE_ATTENTION_KINDS
             and not _declares_slot_compression(spec)
             # (num_blocks, 2, block_size, num_heads, head_size) layout whose
             # block dim disagrees with the scheduler block-id unit -- the
