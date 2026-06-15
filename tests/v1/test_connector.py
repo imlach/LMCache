@@ -10,11 +10,12 @@ import torch
 
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import PinMemoryAllocator
+from lmcache.v1.memory_management import MemoryFormat, PinMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.protocol import RemoteMetadata
+from lmcache.v1.protocol import RemoteMetadata, ServerMetaMessage, ServerReturnCode
 from lmcache.v1.storage_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.connector import CreateConnector
+from lmcache.v1.storage_backend.connector.lm_connector import LMCServerConnector
 
 # Local
 from .utils import (
@@ -74,6 +75,154 @@ def test_lm_connector(url, autorelease_v1, lmserver_v1_process):
 
     close_asyncio_loop(async_loop, async_thread)
     local_cpu_backend.close()
+
+
+class _FakeAsyncLoop:
+    async def sock_sendall(self, sock, data):
+        sock.sendall(data)
+
+
+class _FakeSocket:
+    def __init__(self, *, fail_first_send=False, recv_payload=b""):
+        self.fail_first_send = fail_first_send
+        self.recv_payload = recv_payload
+        self.connected_to = None
+        self.closed = False
+        self.sent = []
+
+    def connect(self, addr):
+        self.connected_to = addr
+
+    def sendall(self, data):
+        if self.fail_first_send:
+            self.fail_first_send = False
+            raise BrokenPipeError("simulated restored dead socket")
+        self.sent.append(data)
+
+    def recv(self, n):
+        payload = self.recv_payload[:n]
+        self.recv_payload = self.recv_payload[n:]
+        return payload
+
+    def close(self):
+        self.closed = True
+
+
+def test_lm_connector_reconnects_put_after_socket_failure(monkeypatch):
+    sockets = []
+
+    def fake_connect(connector):
+        sock = _FakeSocket(fail_first_send=len(sockets) == 0)
+        sock.connect((connector.host, connector.port))
+        sockets.append(sock)
+        return sock
+
+    monkeypatch.setattr(LMCServerConnector, "_connect", fake_connect)
+
+    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
+    try:
+        connector = LMCServerConnector(
+            "lmcache-server-3090.inference.svc.cluster.local",
+            65432,
+            _FakeAsyncLoop(),
+            local_cpu_backend,
+        )
+        memory_obj = local_cpu_backend.allocate(
+            torch.Size([2, 32, 8, 64]), torch.bfloat16
+        )
+        try:
+            asyncio.run(connector.put(dumb_cache_engine_key(), memory_obj))
+        finally:
+            memory_obj.ref_count_down()
+
+        assert len(sockets) == 2
+        assert sockets[0].closed
+        assert sockets[1].connected_to == (
+            "lmcache-server-3090.inference.svc.cluster.local",
+            65432,
+        )
+        assert len(sockets[1].sent) == 2
+    finally:
+        local_cpu_backend.close()
+
+
+def test_lm_connector_reconnects_exists_after_socket_failure(monkeypatch):
+    sockets = []
+    exists_success = ServerMetaMessage(
+        ServerReturnCode.SUCCESS,
+        0,
+        MemoryFormat(1),
+        torch.float16,
+        torch.Size([0, 0, 0, 0]),
+    ).serialize()
+
+    def fake_connect(connector):
+        sock = _FakeSocket(
+            fail_first_send=len(sockets) == 0,
+            recv_payload=exists_success,
+        )
+        sock.connect((connector.host, connector.port))
+        sockets.append(sock)
+        return sock
+
+    monkeypatch.setattr(LMCServerConnector, "_connect", fake_connect)
+
+    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
+    try:
+        connector = LMCServerConnector(
+            "lmcache-server-3090.inference.svc.cluster.local",
+            65432,
+            _FakeAsyncLoop(),
+            local_cpu_backend,
+        )
+
+        assert asyncio.run(connector.exists(dumb_cache_engine_key())) is True
+        assert len(sockets) == 2
+        assert sockets[0].closed
+        assert len(sockets[1].sent) == 1
+    finally:
+        local_cpu_backend.close()
+
+
+def test_lm_connector_reconnects_get_after_socket_failure(monkeypatch):
+    sockets = []
+    get_miss = ServerMetaMessage(
+        ServerReturnCode.FAIL,
+        0,
+        MemoryFormat(1),
+        torch.float16,
+        torch.Size([0, 0, 0, 0]),
+    ).serialize()
+
+    def fake_connect(connector):
+        sock = _FakeSocket(
+            fail_first_send=len(sockets) == 0,
+            recv_payload=get_miss,
+        )
+        sock.connect((connector.host, connector.port))
+        sockets.append(sock)
+        return sock
+
+    monkeypatch.setattr(LMCServerConnector, "_connect", fake_connect)
+
+    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
+    try:
+        connector = LMCServerConnector(
+            "lmcache-server-3090.inference.svc.cluster.local",
+            65432,
+            _FakeAsyncLoop(),
+            local_cpu_backend,
+        )
+
+        assert asyncio.run(connector.get(dumb_cache_engine_key())) is None
+        assert len(sockets) == 2
+        assert sockets[0].closed
+        assert len(sockets[1].sent) == 1
+    finally:
+        local_cpu_backend.close()
 
 
 @pytest.mark.parametrize("full_chunk", [True, False])

@@ -15,6 +15,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     _get_hybrid_state_payload,
     _hybrid_state_key,
     _hybrid_state_payload_nbytes,
+    _normalize_hybrid_state_group_block_sizes,
     _put_hybrid_state_payload,
 )
 from lmcache.v1.storage_backend.hybrid_state_disk import (
@@ -159,6 +160,27 @@ def test_unknown_kv_cache_specs_are_not_treated_as_hybrid_state(caplog) -> None:
 
     assert not is_hybrid
     assert "Unknown vLLM KV cache spec" in caplog.text
+
+
+def test_hybrid_state_block_size_normalization_uses_attention_block_size() -> None:
+    hybrid_groups = (
+        HybridStateGroupSpec(0, ("mamba0",), 81920, 64),
+        HybridStateGroupSpec(1, ("mamba1",), 81920, 64),
+    )
+
+    normalized = _normalize_hybrid_state_group_block_sizes(hybrid_groups, 1584)
+
+    assert [group.block_size for group in normalized] == [1584, 1584]
+    assert [group.group_id for group in normalized] == [0, 1]
+    assert [group.layer_names for group in normalized] == [("mamba0",), ("mamba1",)]
+
+
+def test_hybrid_state_block_size_normalization_keeps_smaller_block_size() -> None:
+    hybrid_groups = (HybridStateGroupSpec(0, ("mamba0",), 1568, 64),)
+
+    assert (
+        _normalize_hybrid_state_group_block_sizes(hybrid_groups, 1584) == hybrid_groups
+    )
 
 
 def _make_block_id_connector() -> LMCacheConnectorV1Impl:

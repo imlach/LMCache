@@ -355,6 +355,40 @@ def _select_hybrid_state_kv_cache_groups(
     return hybrid_groups
 
 
+def _normalize_hybrid_state_group_block_sizes(
+    hybrid_groups: tuple[HybridStateGroupSpec, ...],
+    lmcache_block_size: Optional[int],
+) -> tuple[HybridStateGroupSpec, ...]:
+    """Normalize full-context hybrid block sizes to the transfer block size.
+
+    Some MTP/GDN configurations report recurrent-state group ``block_size`` as
+    ``max_model_len`` while the attention transfer group exposes the usable KV
+    block size. Hybrid capture alignment must follow the attention/KV chunking
+    cadence, otherwise every normal prompt below full context rounds down to 0.
+    """
+    if lmcache_block_size is None:
+        return hybrid_groups
+
+    normalized_groups: list[HybridStateGroupSpec] = []
+    for group in hybrid_groups:
+        if group.block_size > lmcache_block_size:
+            logger.info(
+                "Normalizing hybrid state group %d block_size from %d "
+                "to LMCache attention block_size %d for alignment",
+                group.group_id,
+                group.block_size,
+                lmcache_block_size,
+            )
+            group = HybridStateGroupSpec(
+                group_id=group.group_id,
+                layer_names=group.layer_names,
+                block_size=lmcache_block_size,
+                page_size_bytes=group.page_size_bytes,
+            )
+        normalized_groups.append(group)
+    return tuple(normalized_groups)
+
+
 def _lmcache_loads_cover_all_kv_cache_groups(kv_cache_config: Optional[Any]) -> bool:
     """Return whether one LMCache block-id stream covers vLLM's KV groups."""
     kv_cache_groups = getattr(kv_cache_config, "kv_cache_groups", None)
@@ -1010,6 +1044,10 @@ class LMCacheConnectorV1Impl:
         ) = _select_lmcache_kv_cache_group(parent_kv_cache_config)
         self._hybrid_state_kv_cache_groups = _select_hybrid_state_kv_cache_groups(
             parent_kv_cache_config
+        )
+        self._hybrid_state_kv_cache_groups = _normalize_hybrid_state_group_block_sizes(
+            self._hybrid_state_kv_cache_groups,
+            self._lmcache_kv_cache_block_size,
         )
         self._hybrid_state_alignment_tokens = (
             math.lcm(
