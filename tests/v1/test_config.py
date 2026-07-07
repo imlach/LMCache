@@ -884,6 +884,56 @@ class TestControllerConfigValidation:
         config.validate()
 
 
+class TestP2pRequiresAsyncLoadingValidation:
+    """enable_p2p=True routes lookups through LookupClientFactory, which
+    only selects the async LMCacheAsyncLookupClient when
+    enable_async_loading=True. Otherwise it falls back to the sync
+    LMCacheLookupClient, whose p2p_backend.contains() is hardcoded to
+    return False ("synchronous contain is not supported for now"), so the
+    controller-mediated cross-instance P2P lookup is never reached. Reject
+    the combination at config-validation time instead of silently no-op'ing
+    at runtime."""
+
+    @staticmethod
+    def _make_p2p_config(**overrides):
+        """Create a config with P2P enabled and all of its required
+        preconditions set (controller URLs, worker/peer ports, transfer
+        channel), plus enable_async_loading=True. Override specific fields
+        via kwargs to exercise individual validation checks."""
+        config = LMCacheEngineConfig.from_defaults()
+        config.enable_p2p = True
+        config.enable_controller = True
+        config.controller_pull_url = "tcp://localhost:9001"
+        config.controller_reply_url = "tcp://localhost:9002"
+        config.lmcache_instance_id = "test"
+        config.lmcache_worker_ports = [9000]
+        config.p2p_host = "localhost"
+        config.p2p_init_ports = [9003]
+        config.p2p_lookup_ports = [9004]
+        config.transfer_channel = "nixl"
+        config.enable_async_loading = True
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_p2p_without_async_loading_raises(self):
+        config = self._make_p2p_config(enable_async_loading=False)
+        with pytest.raises(ValueError, match="enable_async_loading"):
+            config.validate()
+
+    def test_p2p_with_async_loading_no_error(self):
+        config = self._make_p2p_config()
+        config.validate()  # Should not raise
+
+    def test_p2p_disabled_ignores_async_loading(self):
+        config = LMCacheEngineConfig.from_defaults(
+            enable_p2p=False,
+            enable_async_loading=False,
+        )
+        # P2P is disabled, so the async-loading requirement doesn't apply.
+        config.validate()
+
+
 class TestNixlBufferDeviceCpuValidation:
     """Validate the rejection of nixl_buffer_size in CPU mode and the
     max_local_cpu_size requirement (see review item #1)."""
@@ -934,7 +984,8 @@ class TestNixlBufferDeviceCpuValidation:
         has not been exercised end-to-end; reject until it has been."""
         config = self._nixl_cpu_defaults()
         # enable_p2p has its own validate() preconditions (controller URLs,
-        # peer ports, transfer_channel); set them so we hit the NIXL block.
+        # peer ports, transfer_channel, enable_async_loading); set them so
+        # we hit the NIXL block.
         config.enable_p2p = True
         config.enable_controller = True
         config.controller_pull_url = "tcp://localhost:9001"
@@ -945,6 +996,7 @@ class TestNixlBufferDeviceCpuValidation:
         config.p2p_init_ports = [9003]
         config.p2p_lookup_ports = [9004]
         config.transfer_channel = "nixl"
+        config.enable_async_loading = True
         with pytest.raises(ValueError, match="has not been validated end-to-end"):
             config.validate()
 
@@ -964,6 +1016,7 @@ class TestNixlBufferDeviceCpuValidation:
         config.p2p_init_ports = [9003]
         config.p2p_lookup_ports = [9004]
         config.transfer_channel = "nixl"
+        config.enable_async_loading = True
         config.validate()  # Should not raise
 
 

@@ -738,6 +738,13 @@ def _validate_config(self):
         assert self.p2p_init_ports is not None
         assert self.p2p_lookup_ports is not None
         assert self.transfer_channel is not None
+        if not self.enable_async_loading:
+            raise ValueError(
+                "enable_p2p=True requires enable_async_loading=True; "
+                "the sync LMCacheLookupClient does not route through "
+                "p2p_backend's controller-mediated lookup "
+                "(p2p_backend.contains() returns False)."
+            )
 
     enable_nixl_storage = self.extra_config is not None and self.extra_config.get(
         "enable_nixl_storage"
